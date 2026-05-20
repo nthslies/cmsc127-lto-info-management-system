@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LTO Information Management System Portal</title>
+    <link rel="stylesheet" href="login.css">
+</head>
+<body>
+
+    <header>
+        <div class="header-content">
+            LTMS PORTAL <br>
+            <span class="header-subtitle">Land Transportation Management</span>
+        </div>
+    </header>
+
+    <div class="content-wrapper">
+        <div class="banner-content">
+            Welcome! <br>
+            <span style="font-size:13px; font-weight:300;">Please log in below</span>
+        </div>
+
+        <div class="panel-container">
+            <div class="tab-box">
+                <button class="tab-btn active" onclick="toggleForm('admin')">Personnel Login</button>
+                <button class="tab-btn" onclick="toggleForm('driver')">Driver Lookup</button>
+            </div>
+
+            <div id="admin-form" class="auth-form active">
+                <input type="text" id="admin_uid" placeholder="Personnel ID Entry">
+                <input type="password" id="admin_pwd" placeholder="System Security Password">
+                <button class="action-btn" onclick="submitPersonnelAuth()">Authenticate Terminal</button>
+            </div>
+
+            <div id="driver-form" class="auth-form">
+                <input type="text" id="driver_lic" placeholder="License Code Key (e.g., N01-23-000001)">
+                <input type="text" id="driver_lname" placeholder="Registered Surname Match">
+                <button class="action-btn btn-driver-submit" onclick="submitDriverAuth()">Verify Credentials</button>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <div class="footer-content">
+            A CMSC 127 Project
+        </div>
+    </footer>
+
+    <script>
+        function toggleForm(target) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.auth-form').forEach(f => f.classList.remove('active'));
+            if(target === 'admin') {
+                document.querySelectorAll('.tab-btn')[0].classList.add('active');
+                document.getElementById('admin-form').classList.add('active');
+            } else {
+                document.querySelectorAll('.tab-btn')[1].classList.add('active');
+                document.getElementById('driver-form').classList.add('active');
+            }
+        }
+
+        async function submitPersonnelAuth() {
+            const response = await fetch('/api/auth/admin', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ 
+                    admin_id: document.getElementById('admin_uid').value, 
+                    password: document.getElementById('admin_pwd').value 
+                })
+            });
+            if (response.ok) {
+                const payload = await response.json();
+                if(payload.success) {
+                    window.location.href = '/admin.html';
+                } else { alert(payload.message); }
+            } else {
+                alert("Access Denied: Invalid Personnel Key or Security Password.");
+            }
+        }
+
+        async function submitDriverAuth() {
+            const response = await fetch('/api/auth/driver', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ 
+                    license_num: document.getElementById('driver_lic').value, 
+                    last_name: document.getElementById('driver_lname').value 
+                })
+            });
+            const payload = await response.json();
+            if(payload.success) {
+                sessionStorage.setItem('current_driver_license', payload.license_number);
+                sessionStorage.setItem('current_driver_name', payload.full_name);
+                window.location.href = '/driver.html';
+            } else { alert(payload.message || "No matching driver records found."); }
+        }
+    </script>
+</body>
+</html>
