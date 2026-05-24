@@ -1,12 +1,15 @@
 # admin_main.py
 import mysql.connector
 import re
-from datetime import datetime
+import time
+from datetime import datetime, date
 from tabulate import tabulate
+
 from reports import (
     view_drivers_filtered, view_vehicles_by_owner, view_expired_registrations,
     view_invalid_licenses, view_driver_violations_by_date, 
-    view_violation_distribution_by_year, view_violations_by_location
+    view_violation_distribution_by_year, view_violations_by_location,
+    is_invalid_license_format, is_invalid_date_format, is_invalid_year_format
 )
 
 def admin_main(admin_name, conn):
@@ -59,8 +62,8 @@ def generate_reports_menu(conn):
             if report == '1':
                 view_drivers_filtered(cur)
             elif report == '2':
-                last_name = input("Enter Driver's Registered Last Name: ").strip()
-                view_vehicles_by_owner(cur, last_name)
+                license_number = input("Enter Driver's License Number: ").strip()
+                view_vehicles_by_owner(cur, license_number)
             elif report == '3':
                 target_date = input("Enter Cutoff Date (YYYY-MM-DD): ").strip()
                 view_expired_registrations(cur, target_date)
@@ -80,9 +83,9 @@ def generate_reports_menu(conn):
             elif report == '0':
                 break
             else:
-                print("⚠️ Selection unrecognized.")
+                print(" Selection unrecognized.")
         except mysql.connector.Error as err:
-            print(f"⚠️ Query Error: {err}")
+            print(f" Query Error: {err}")
             
     cur.close()
 
@@ -111,56 +114,133 @@ def add_menu(conn):
 
 def get_next_registration_number(conn):
     cur = conn.cursor()
-    cur.execute("SELECT registration_number FROM registration ORDER BY registration_number DESC LIMIT 1;")
-    result = cur.fetchone()
-    cur.close()
-    if result:
-        try:
-            last_num = int(result[0].split('-')[1])
-            return f"REG-{last_num + 1:03d}"
-        except:
-            return "REG-026"
-    return "REG-001"
+    try:
+        query = """
+            SELECT COALESCE(MAX(CAST(SUBSTRING_INDEX(registration_number, '-', -1) AS UNSIGNED)), 0) AS max_num 
+            FROM registration;
+        """
+        cur.execute(query)
+        result = cur.fetchone()
+        
+        if result and result[0] is not None:
+            next_num = int(result[0]) + 1
+        else:
+            next_num = 1
+        
+        return f"REG-{str(next_num).zfill(3)}"
+        
+    except Exception as e:
+        print(f" System Warning: Registry auto-sequence anomaly detected ({e}). Utilizing emergency fallback timestamp.")
+        emergency_stamp = int(time.time())
+        return f"REG-{emergency_stamp}"
+    finally:
+        cur.close()
 
 def register_driver(conn):
     print("\n --- Register New Driver Profile ---")
     lic_num = input("License Number (e.g., N01-24-000099): ").strip()
     if not lic_num:
-        print(" License Number cannot be empty.")
+        print(" Input Error: License Number cannot be empty.")
+        return
+    if is_invalid_license_format(lic_num):
         return
 
+    # FORMAT GATE: Validates calendar format layout immediately
+    dob_input = input("Date of Birth (YYYY-MM-DD): ").strip()
+    if is_invalid_date_format(dob_input): 
+        return
+
+    dob_date = datetime.strptime(dob_input, "%Y-%m-%d").date()
+
+    # age limit for student's driver license (must be 16 at least for a license)
+    current_date = date.today()
+    calculated_age = current_date.year - dob_date.year - ((current_date.month, current_date.day) < (dob_date.month, dob_date.day))
+    if calculated_age < 16:
+        print(f" Registration Blocked: Applicant is only {calculated_age} years old. Minimum LTO age requirement is 16.")
+        return    
+
+    sex = input("Sex (M/F): ").strip().upper()
+    if sex not in ['M', 'F']:
+        print(" Input Error: Sex parameter choice option must be exactly M or F.")
+        return
+
+    # ═════════════════════════════════════════════════════════════════
+    # 🖩 AUTOMATED LICENSE EXPRATION CALCULATOR GATE
+    # ═════════════════════════════════════════════════════════════════
+    print("\nSelect License Classification:")
+    print(" [1] Student Permit\n [2] Non-Professional\n [3] Professional")
+    type_choice = input("Choice (1-3): ").strip()
+
+    if type_choice not in ['1', '2', '3']:
+        print(" Input Error: Selection unrecognized. Operation aborted.")
+        return
+
+    if type_choice == '1':
+        l_type = "Student Permit"
+        # student permits expire exactly 1 year from today's registration processing date
+        exp_date = date(current_date.year + 1, current_date.month, current_date.day)
+    else:
+        l_type = "Professional" if type_choice == '3' else "Non-Professional"
+        # pro/non-Pro cards expire exactly 5 years from the next birth anniversary cycle
+        # target the birth month/day 5 years into the future
+        target_year = current_date.year + 5
+        try:
+            exp_date = date(target_year, dob_date.month, dob_date.day)
+        except ValueError:
+            # handle the rare leap year edge case (Feb 29 birthday) safely shifting to Feb 28
+            exp_date = date(target_year, 2, 28)
+
+    # transform calculated date objects back into SQL-ready strings
+    exp_input = exp_date.strftime("%Y-%m-%d")
+
+    # pre-flight database check: prevents primary key duplicates
     cur = conn.cursor()
     cur.execute("SELECT license_number FROM driver WHERE license_number = %s", (lic_num,))
     if cur.fetchone():
-        print(" Pre-flight Gate: Driver record already exists!")
+        print("Pre-flight Gate: Driver record already exists inside registry!")
         cur.close()
         return
     cur.close()
 
-    f_name = input("First Name: ").strip() or "Unknown"
+    # Collect remaining details safely
+    f_name = input("First Name: ").strip()
+    if not f_name or f_name.isdigit():
+        print(" Input Error: First name cannot be empty or strictly numeric.")
+        return
+
     m_name = input("Middle Name (Optional): ").strip() or None
-    l_name = input("Last Name: ").strip() or "Unknown"
-    dob = input("Date of Birth (YYYY-MM-DD): ").strip() or "2000-01-01"
-    sex = input("Sex (M/F): ").strip().upper() or "M"
-    addr = input("Complete Home Address: ").strip() or "Not Specified"
-    exp = input("License Expiry Date (YYYY-MM-DD): ").strip() or "2031-01-01"
-    l_type = input("Type (Student Permit/Non-Professional/Professional): ").strip() or "Non-Professional"
-    l_stat = input("Status (Active/Expired/Suspended/Revoked): ").strip() or "Active"
+
+    l_name = input("Last Name: ").strip()
+    if not l_name or l_name.isdigit():
+        print(" Input Error: Last name cannot be empty.")
+        return
+
+    addr = input("Complete Home Address: ").strip()
+    if not addr:
+        print(" Input Error: Operational address field is required.")
+        return
+    
+    l_stat = input("Status (Active/Expired/Suspended): ").strip() or "Active"
 
     try:
         cur = conn.cursor()
         query = """INSERT INTO driver (license_number, first_name, middle_name, last_name, date_of_birth, sex, address, expiry_date, license_type, license_status) 
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-        cur.execute(query, (lic_num, f_name, m_name, l_name, dob, sex, addr, exp, l_type, l_stat))
+        cur.execute(query, (lic_num, f_name, m_name, l_name, dob_input, sex, addr, exp_input, l_type, l_stat))
         conn.commit()
-        print(" Driver profile saved successfully.")
+        
+        print(f"\n Driver profile saved successfully!")
+        print(f" System Generated Expiration Stamp: {exp_date.strftime('%A, %B %d, %Y')}")
         cur.close()
     except mysql.connector.Error as err:
-        print(f" DB Error: {err}")
+        print(f" DB Transaction Error: {err}")
 
 def register_vehicle(conn):
     print("\n --- Register New Motor Vehicle ---")
-    lic_num = input("Owner's License Number Link: ").strip()
+    lic_num = input("Owner's License Number: ").strip()
+
+    if is_invalid_license_format(lic_num):
+        return
 
     cur = conn.cursor()
     cur.execute("SELECT first_name, last_name FROM driver WHERE license_number = %s", (lic_num,))
@@ -171,24 +251,57 @@ def register_vehicle(conn):
         print(f" Pre-flight Error: Driver license '{lic_num}' is not registered!")
         return
 
-    plate = input("Plate Number: ").strip()
-    if not plate: return
-    engine = input("Engine Number: ").strip() or "ENG-GENERIC"
-    chassis = input("Chassis Number: ").strip() or "CHS-GENERIC"
-    v_type = input("Vehicle Type: ").strip() or "Sedan"
-    make = input("Manufacturer/Make: ").strip() or "Toyota"
-    model = input("Model: ").strip() or "Vios"
-    
-    year_input = input("Year of Manufacture (YYYY): ").strip()
-    year = int(year_input) if (year_input.isdigit() and len(year_input) == 4) else 2026
+    plate = input("Plate Number: ").strip().upper()
+    if not (3 <= len(plate) <= 7 and plate.isalnum()):
+        print(" Input Error: Plate number must be between 3 to 7 alphanumeric characters (e.g., OWN2024).")
+        return
 
-    color = input("Color: ").strip() or "Black"
+    engine = input("Engine Number (e.g. ENG-E101): ").strip().upper()
+    if not (6 <= len(engine) <= 15):
+        print(" Input Error: Engine number must be between 6 to 15 characters.")
+        return
+
+    chassis = input("Chassis Number (e.g. CHS-E101): ").strip().upper()
+    if not (6 <= len(chassis) <= 17):
+        print(" Input Error: Chassis number/VIN must be between 6 to 17 characters.")
+        return
+
+    v_type = input("Vehicle Type (e.g., Sedan, SUV, Motorcycle): ").strip()
+    if not v_type or v_type.isdigit():
+        print(" Input Error: Vehicle type cannot be left blank and must be a descriptive textual string.")
+        return
+
+    make = input("Manufacturer/Make (e.g., Toyota, Honda, Mitsubishi): ").strip()
+    if not make or make.isdigit():
+        print(" Input Error: Manufacturer brand name cannot be left blank.")
+        return
+
+    model = input("Model (e.g., Vios, Montero, Civic): ").strip()
+    if not model:
+        print(" Input Error: Vehicle model designation line cannot be left blank.")
+        return
+
+    year_input = input("Year of Manufacture (YYYY): ").strip()
+    if is_invalid_year_format(year_input):
+        return
+    year = int(year_input)
+
+    color = input("Color: ").strip()
+    if not color or color.isdigit():
+        print(" Input Error: Vehicle color details must be explicitly specified.")
+        return
     
     print("\nSelect Vehicle Classification:")
     print(" [1] Private Car\n [2] For-Hire / PUV (Commercial)")
     class_choice = input("Choice (1-2): ").strip()
     v_class = "For-Hire/PUV" if class_choice == '2' else "Private"
-    franchise = input("Enter LTFRB Franchise Token Number (or press Enter if Private): ").strip() or None if class_choice == '2' else None
+
+    franchise = None
+    if class_choice == '2':
+        franchise = input("Enter LTFRB Franchise Number [e.g.LTFRB-NCR-2018-1122]: ").strip()
+        if not franchise:
+            print(" Validation Error: For-Hire commercial units require an active franchise.")
+            return
 
     try:
         cur = conn.cursor()
@@ -202,127 +315,9 @@ def register_vehicle(conn):
         conn.commit()
         print(f" Vehicle registry finalized. Auto-generated Registration ID: {auto_reg_id}")
         cur.close()
+
     except mysql.connector.Error as err:
         print(f" System rejected database transaction: {err}")
-
-def record_new_apprehension(conn):
-    print("\n --- LTO OFFICIAL APPREHENSION LOGGING GATE ---")
-    lic_num = input("Enter Driver License Number: ").strip()
-
-    # Pre-flight check: Verify driver exists and fetch current standing
-    cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT first_name, last_name, accumulated_demerit_points, license_status FROM driver WHERE license_number = %s", (lic_num,))
-    driver = cur.fetchone()
-    
-    if not driver:
-        print(f" Entry Aborted: Driver License '{lic_num}' does not exist in registry database.")
-        cur.close()
-        return
-
-    print(f" Driver Found: {driver['first_name']} {driver['last_name']} (Current Points: {driver['accumulated_demerit_points']})")
-
-    # Display clean master codes so admin is never confused
-    print("\nMaster Infraction Codes:")
-    print("  [V_DOCS]  Documentation Omission    [V_CHILD] Child Motorcycle Hazard")
-    print("  [V_DIST]  Distracted Driving         [V_SGEAR] Safety Gear Non-Compliance")
-    print("  [V_ENVIR] Environmental Omission    [V_CARE]  Careless Driving / Lane Error")
-    print("  [V_TURN]  Improper Turning / Sign    [V_CARGO] Insecure Cargo Securement")
-    print("  [V_PUV]   PUV Franchise Abuse        [V_REGIS] Unregistered MV / Colorum")
-    print("  [V_DUI]   Driving Under Influence    [V_FRAUD] Counterfeit Papers / Crime")
-    
-    v_code = input("\nEnter Infraction Code from ticket: ").strip().upper()
-    cur.execute("SELECT * FROM violationType WHERE violation_code = %s", (v_code,))
-    v_type = cur.fetchone()
-
-    if not v_type:
-        print(" Entry Aborted: Unrecognized Infraction Code.")
-        cur.close()
-        return
-
-    # ═════════════════════════════════════════════════════════════════
-    #  THE SYSTEMATIC OFFENSE COUNTING ALGORITHM
-    # ═════════════════════════════════════════════════════════════════
-    
-    # Count how many times this specific driver has committed this specific infraction code via the new schema link
-    count_query = """
-        SELECT COUNT(*) AS historic_count FROM violation 
-        WHERE license_number = %s AND violation_code = %s
-    """
-    cur.execute(count_query, (lic_num, v_code))
-    past_offenses = cur.fetchone()['historic_count']
-    current_offense_number = past_offenses + 1  # Automatic tracking pointer
-
-    # Determine base values from the master lookup configuration
-    base_points = int(v_type['demerit_points'])
-    base_fine = float(v_type['fine_amount'])
-    tier_label = v_type['severity_category']
-    
-    assigned_points = base_points
-    assigned_fine = base_fine
-
-    # Apply RA 10930 graduated scaling rule sets dynamically based on offense number history
-    if v_code in ['V_DOCS', 'V_CHILD', 'V_DIST', 'V_SGEAR', 'V_ENVIR', 'V_CARE', 'V_TURN']:
-        if current_offense_number == 1:
-            assigned_points = 1
-            tier_label = "Light"
-        elif current_offense_number == 2:
-            assigned_points = 3
-            tier_label = "Less Grave"
-        else:
-            assigned_points = 5
-            tier_label = "Grave (Habitual Repeat Violator)"
-            
-    elif v_code in ['V_CARGO', 'V_PUV']:
-        if current_offense_number == 1:
-            assigned_points = 3
-            tier_label = "Less Grave"
-        else:
-            assigned_points = 5
-            tier_label = "Grave (Habitual Repeat Violator)"
-
-    print(f"\n⚡ Point Assessment Dashboard:")
-    print(f"   Detected Tracking: {v_type['violation_name']} -> Offense #{current_offense_number}")
-    print(f"   Assigned Tier    : {tier_label} | Demerit Points: +{assigned_points}")
-    print(f"   Assessed Penalty : ₱{assigned_fine:,.2f}")
-
-    location = input("Enter Apprehension Location (City/Municipality): ").strip() or "Not Specified"
-    plate = input("Enter Apprehension Vehicle Plate Number: ").strip().upper()
-
-    # Dynamic execution sequence to finalize the ticket entry
-    cur.close()
-    cur = conn.cursor()
-    cur.execute("SELECT COALESCE(MAX(violation_id), 0) + 1 FROM violation;")
-    next_id = cur.fetchone()[0]
-
-    try:
-        # 1. Write the new ticket log into the violation infrastructure table
-        query = """
-            INSERT INTO violation (violation_id, violation_date, location, violation_status, license_number, plate_number, violation_code) 
-            VALUES (%s, CURRENT_DATE, %s, 'Unpaid', %s, %s, %s)
-        """
-        cur.execute(query, (next_id, location, lic_num, plate, v_code))
-        
-        # 2. Update point aggregates inside master driver registry row
-        cur.execute(
-            "UPDATE driver SET accumulated_demerit_points = accumulated_demerit_points + %s WHERE license_number = %s",
-            (assigned_points, lic_num)
-        )
-
-        # 3. Enforce automated license suspension thresholds (10 Points)
-        new_total = driver['accumulated_demerit_points'] + assigned_points
-        if new_total >= 10:
-            cur.execute("UPDATE driver SET license_status = 'Suspended' WHERE license_number = %s", (lic_num,))
-            print(f"\n AUTOMATED SYSTEM ENFORCEMENT TRIGGERED:")
-            print(f"   Driver hit {new_total} accumulated points. License status set to 'Suspended'.")
-
-        conn.commit()
-        print(f"\n Apprehension data successfully committed. Saved under Ticket ID: {next_id}")
-
-    except mysql.connector.Error as err:
-        conn.rollback()
-        print(f" Entry Rejected: Database rollback executed due to error: {err}")
-    finally:
-        cur.close()
 
 def record_real_world_apprehension(conn):
     print("\n --- ENTERING REAL-WORLD LTO ENFORCEMENT PORTAL ---")
@@ -346,7 +341,6 @@ def record_real_world_apprehension(conn):
     cur.execute("SELECT COALESCE(SUM(points_changed), 0) AS active_points FROM demerit_ledger WHERE license_number = %s", (lic_num,))
     previous_points = cur.fetchone()['active_points']
 
-    # 2. Collect violation code mapping data
     v_code = input("Enter Infraction Code (e.g., V_CARE, V_DUI): ").strip().upper()
     cur.execute("SELECT * FROM violationType WHERE violation_code = %s", (v_code,))
     v_type = cur.fetchone()
@@ -480,46 +474,228 @@ def update_menu(conn):
 def update_driver_profile(conn):
     print("\n --- Modify Driver Profile (Press Enter to Skip) ---")
     lic_num = input("Enter Target Driver License Number: ").strip()
+    
+    if is_invalid_license_format(lic_num):
+        return
+
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT * FROM driver WHERE license_number = %s", (lic_num,))
         driver = cur.fetchone()
         cur.close()
-        if not driver: return
+        
+        if not driver:
+            print(f" Search Error: No registered driver found matching license '{lic_num}'.")
+            return
 
         f_name = input(f"New First Name [{driver['first_name']}]: ").strip() or driver['first_name']
+        if f_name.isdigit():
+            print(" Input Error: First name cannot be strictly numeric. Modification aborted.")
+            return
+
         m_name = input(f"New Middle Name [{driver['middle_name']}]: ").strip() or driver['middle_name']
+
         l_name = input(f"New Last Name [{driver['last_name']}]: ").strip() or driver['last_name']
+        if l_name.isdigit():
+            print(" Input Error: Last name cannot be strictly numeric. Modification aborted.")
+            return  
+                  
         addr = input(f"New Address [{driver['address']}]: ").strip() or driver['address']
-        l_type = input(f"New License Type [{driver['license_type']}]: ").strip() or driver['license_type']
-        l_stat = input(f"New License Status [{driver['license_status']}]: ").strip() or driver['license_status']
+
+        print(f"\nModify Sex Configuration [Current: {driver['sex']}]:")
+        print("  [1] Male\n  [2] Female\n  [Press Enter to Skip]")
+        sex_choice = input("Select choice (1-2): ").strip()
+        if sex_choice == '1':
+            sex = 'M'
+        elif sex_choice == '2':
+            sex = 'F'
+        elif sex_choice == '':
+            sex = driver['sex']
+        else:
+            print(" Validation Error: Selection unrecognized. Modification aborted.")
+            return
+
+        print(f"\nModify License Classification [Current: {driver['license_type']}]:")
+        print("  [1] Student Permit\n  [2] Non-Professional\n  [3] Professional\n  [Press Enter to Skip]")
+        type_choice = input("Select choice (1-3): ").strip()
+        if type_choice == '1':
+            l_type = "Student Permit"
+        elif type_choice == '2':
+            l_type = "Non-Professional"
+        elif type_choice == '3':
+            l_type = "Professional"
+        elif type_choice == '':
+            l_type = driver['license_type']
+        else:
+            print(" Validation Error: Selection unrecognized. Modification aborted.")
+            return
+
+        exp_input = input(f"\nNew Expiration Date (YYYY-MM-DD) [{driver['expiry_date']}]: ").strip()
+        if exp_input == '':
+            # if skipped, preserve the original date entry safely
+            exp_final_date = driver['expiry_date']
+            # if the database returns the date as a string format, it will parse cleanly
+            if isinstance(exp_final_date, str):
+                exp_final_date = datetime.strptime(exp_final_date, "%Y-%m-%d").date()
+        else:
+            # if typed, execute strict alphanumeric calendar formatting gates instantly
+            if is_invalid_date_format(exp_input):
+                return
+            exp_final_date = datetime.strptime(exp_input, "%Y-%m-%d").date()
+
+        # sync the license status
+        current_date = date.today()
+        if exp_final_date < current_date:
+            l_stat = "Expired"
+        else:
+            # preserve existing glags (Suspended) unless explicitly updated by an overriding date change
+            if driver['license_status'] in ['Suspended'] and exp_input == '':
+                l_stat = driver['license_status']
+            else:
+                l_stat = "Active"
+
+        # convert date object back into a database-ready string sequence
+        exp_final_str = exp_final_date.strftime("%Y-%m-%d")
+
 
         cur = conn.cursor()
-        cur.execute("UPDATE driver SET first_name=%s, middle_name=%s, last_name=%s, address=%s, license_type=%s, license_status=%s WHERE license_number=%s", (f_name, m_name, l_name, addr, l_type, l_stat, lic_num))
+        update_query = """
+            UPDATE driver 
+            SET first_name = %s, middle_name = %s, last_name = %s, sex = %s,
+                address = %s, license_type = %s, expiry_date = %s, license_status = %s 
+            WHERE license_number = %s
+        """
+        cur.execute(update_query, (f_name, m_name, l_name, sex, addr, l_type, exp_final_str, l_stat, lic_num))
         conn.commit()
+
         print(" Updated successfully.")
         cur.close()
-    except mysql.connector.Error as err: print(f" Error: {err}")
+    
+    except mysql.connector.Error as err:
+        print(f" Database Modification Refused: {err}")
+    except Exception as e:
+        print(f" Unexpected Runtime Error: {e}")
 
 def update_vehicle_registration(conn):
-    print("\n --- Update Vehicle Registration ---")
-    plate = input("Enter Target Vehicle Plate Number: ").strip()
+    print("\n --- Update Vehicle Details & Registration (Press Enter to Skip Field) ---")
+    plate = input("Enter Target Vehicle Plate Number: ").strip().upper()
+    if not plate:
+        print(" Input Error: Plate number cannot be blank.")
+        return
+
     try:
         cur = conn.cursor(dictionary=True)
+
+        # get current vehicle data
+        cur.execute("SELECT * FROM vehicle WHERE plate_number = %s", (plate,))
+        v_data = cur.fetchone()
+
+        # get current registration data
         cur.execute("SELECT * FROM registration WHERE plate_number = %s ORDER BY expiration_date DESC LIMIT 1", (plate,))
-        reg = cur.fetchone()
+        r_data = cur.fetchone()
+
+        if not v_data or not r_data:
+            print(f" Search Error: Vehicle profile or active registration history not found for plate '{plate}'.")
+            cur.close()
+            return
+
         cur.close()
-        if not reg: return
 
-        new_date = input(f"New Expiration Date [{reg['expiration_date']}]: ").strip() or reg['expiration_date']
-        new_status = input(f"New Status [{reg['registration_status']}]: ").strip() or reg['registration_status']
+        # ═════════════════════════════════════════════════════════════════
+        # MODULE A: VEHICLE ASSET STRUCTURAL UPDATES
+        # ═════════════════════════════════════════════════════════════════
 
+        make = input(f"New Manufacturer/Make [{v_data['make']}]: ").strip() or v_data['make']
+        if make.isdigit():
+            print(" Input Error: Manufacturer name cannot be strictly numeric. Operation aborted.")
+            return
+
+        model = input(f"New Model Designation [{v_data['model']}]: ").strip() or v_data['model']
+
+        year_input = input(f"New Year of Manufacture [{v_data['year']}]: ").strip()
+        if year_input == '':
+            year = v_data['year']
+        else:
+            if is_invalid_year_format(year_input):
+                return
+            year = int(year_input)
+
+        color = input(f"New Body Color Description [{v_data['color']}]: ").strip() or v_data['color']
+        if color.isdigit():
+            print(" Input Error: Color description cannot be strictly numeric. Operation aborted.")
+            return
+
+        print(f"\nUpdate Vehicle Classification [Current: {v_data['vehicle_classification']}]:")
+        print("  [1] Private Car\n  [2] For-Hire / PUV (Commercial)\n  [Press Enter to Skip]")
+        class_choice = input("Select choice (1-2): ").strip()
+
+        if class_choice == '1':
+            v_class = "Private"
+            franchise = None
+        elif class_choice == '2':
+            v_class = "For-Hire/PUV"
+            # require active LTFRB credentials if transitioning to commercial status
+            current_franchise = v_data['ltfrb_franchise_number'] or "None Registered"
+            franchise = input(f"Enter LTFRB Franchise Token Number [{current_franchise}]: ").strip() or v_data['ltfrb_franchise_number']
+            if not franchise:
+                print(" Validation Error: For-Hire commercial units require a valid franchise token.")
+                return
+        elif class_choice == '':
+            v_class = v_data['vehicle_classification']
+            franchise = v_data['ltfrb_franchise_number']
+        else:
+            print(" Validation Error: Option choice unrecognized. Operation aborted.")
+            return
+
+        # ═════════════════════════════════════════════════════════════════
+        # MODULE B: LIFECYCLE REGISTRATION CALENDAR UPDATES
+        # ═════════════════════════════════════════════════════════════════
+        exp_input = input(f"\nNew Registration Expiration Date (YYYY-MM-DD) [{r_data['expiration_date']}]: ").strip()
+        if exp_input == '':
+            exp_final_date = r_data['expiration_date']
+            if isinstance(exp_final_date, str):
+                exp_final_date = datetime.strptime(exp_final_date, "%Y-%m-%d").date()
+        else:
+            if is_invalid_date_format(exp_input):
+                return
+            exp_final_date = datetime.strptime(exp_input, "%Y-%m-%d").date()
+
+        current_date = date.today()
+        r_status = "Expired" if exp_final_date < current_date else "Active"
+        exp_final_str = exp_final_date.strftime("%Y-%m-%d")
+
+        # ═════════════════════════════════════════════════════════════════
+        # MODULE C: COMMIT TRANSACTIONS TO DATABASE PLATES
+        # ═════════════════════════════════════════════════════════════════
         cur = conn.cursor()
-        cur.execute("UPDATE registration SET expiration_date = %s, registration_status = %s WHERE registration_number = %s", (new_date, new_status, reg['registration_number']))
+
+        # update structural fields in vehicle table
+        v_query = """
+            UPDATE vehicle 
+            SET make = %s, model = %s, year = %s, color = %s, 
+                vehicle_classification = %s, ltfrb_franchise_number = %s 
+            WHERE plate_number = %s
+        """
+        cur.execute(v_query, (make, model, year, color, v_class, franchise, plate))
+        
+        # update lifecycle fields in registration table
+        r_query = """
+            UPDATE registration 
+            SET expiration_date = %s, registration_status = %s 
+            WHERE registration_number = %s
+        """
+        cur.execute(r_query, (exp_final_str, r_status, r_data['registration_number']))
+
         conn.commit()
-        print(" Timeline refreshed successfully.")
+
+        print(f"\n SUCCESS: Vehicle asset attributes and operational logs modified cleanly!")
+        print(f" Automated Registration Status: Adjusted to '{r_status}' based on calendar timelines.")
         cur.close()
-    except mysql.connector.Error as err: print(f" Error: {err}")
+
+    except mysql.connector.Error as err:
+        print(f" Database Modification Refused: {err}")
+    except Exception as e:
+        print(f" Unexpected Runtime Error: {e}")
 
 # ═════════════════════════════════════════════════════════════════════
 # RECORD MANAGEMENT DELETION WORKFLOWS WITH CASCADE PROTECT (CRUD Step 3)
@@ -536,46 +712,109 @@ def delete_menu(conn):
         elif choice == '0': break
 
 def delete_driver(conn):
-    print("\n --- Remove Driver Record ---")
+    print("\n --- Remove Driver Record Framework ---")
     lic_num = input("Enter Driver License Number to DELETE: ").strip()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM vehicle WHERE license_number = %s", (lic_num,))
-        v_count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM violation WHERE license_number = %s", (lic_num,))
-        viol_count = cur.fetchone()[0]
-        cur.close()
+    
+    if is_invalid_license_format(lic_num):
+        return
 
-        if v_count > 0 or viol_count > 0:
-            print("\n🚨 CRITICAL WARNING: Deleting this driver will break relational database links!")
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT first_name, last_name FROM driver WHERE license_number = %s", (lic_num,))
+        driver = cur.fetchone()
+        
+        if not driver:
+            print(f" Search Error: Driver license '{lic_num}' does not exist in registry database.")
+            cur.close()
             return
 
-        confirm = input(f"\nAre you sure you want to permanently delete driver {lic_num}? (YES/NO): ").strip().upper()
-        if confirm == 'YES':
-            cur = conn.cursor()
-            cur.execute("DELETE FROM driver WHERE license_number = %s", (lic_num,))
-            conn.commit()
-            print(" Driver record purged cleanly.")
-            cur.close()
-    except mysql.connector.Error as err: print(f"❌ Error: {err}")
-
-def delete_vehicle(conn):
-    print("\n --- Remove Registered Vehicle ---")
-    plate = input("Enter Vehicle Plate Number to DELETE: ").strip()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM registration WHERE plate_number = %s", (plate,))
-        r_count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM violation WHERE plate_number = %s", (plate,))
-        v_count = cur.fetchone()[0]
+        # Scan for active relational records connected to this driver
+        cur.execute("SELECT COUNT(*) AS c FROM vehicle WHERE license_number = %s", (lic_num,))
+        v_count = cur.fetchone()['c']
+        cur.execute("SELECT COUNT(*) AS c FROM violation WHERE license_number = %s", (lic_num,))
+        viol_count = cur.fetchone()['c']
         cur.close()
 
-        confirm = input(f"Confirm permanent removal of asset {plate}? (YES/NO): ").strip().upper()
-        if confirm == 'YES':
-            cur = conn.cursor()
-            cur.execute("DELETE FROM registration WHERE plate_number = %s", (plate,))
-            cur.execute("DELETE FROM vehicle WHERE plate_number = %s", (plate,))
-            conn.commit()
-            print(" Vehicle asset structural registration destroyed completely.")
+        # Dynamic warning notice if active relational paths are discovered
+        if v_count > 0 or viol_count > 0:
+            print(f"\n CRITICAL LINKAGE ALERT: {driver['first_name']} {driver['last_name']} has active assets:")
+            print(f"   - Linked Registered Motor Vehicles: {v_count} unit(s)")
+            print(f"   - Linked Traffic Citation Violations: {viol_count} record(s)")
+            print("\n REAL-WORLD COMPLIANCE CASCADING POLICY:")
+            print("   Executing this action will permanently PURGE all their registered vehicle profiles,")
+            print("   registration lifecycles, and traffic demerit ledger histories completely.")
+            
+            confirm_cascade = input("\nProceed with total system cascade purge? (Type CASCADE-DELETE): ").strip()
+            if confirm_cascade != "CASCADE-DELETE":
+                print(" Operation aborted safely to preserve database table infrastructure.")
+                return
+        else:
+            confirm = input(f"\nAre you sure you want to permanently delete driver {lic_num}? (YES/NO): ").strip().upper()
+            if confirm != 'YES':
+                print(" Transaction cancelled by user.")
+                return
+
+        cur = conn.cursor()
+        
+        cur.execute("DELETE FROM demerit_ledger WHERE license_number = %s", (lic_num,))        
+        cur.execute("DELETE FROM violation WHERE license_number = %s", (lic_num,))        
+        cur.execute("DELETE FROM registration WHERE plate_number IN (SELECT plate_number FROM vehicle WHERE license_number = %s)", (lic_num,))        
+        cur.execute("DELETE FROM vehicle WHERE license_number = %s", (lic_num,))        
+        cur.execute("DELETE FROM driver WHERE license_number = %s", (lic_num,))
+        
+        conn.commit()
+        print(f"\n  CRITICAL PURGE COMPLETE: Driver '{lic_num}' and all connected records removed from the network.")
+        cur.close()
+
+    except mysql.connector.Error as err:
+        conn.rollback() # Rolls back transaction modifications if an execution error occurs
+        print(f"  Database Cascading Purge Failure: {err}")
+
+
+def delete_vehicle(conn):
+    print("\n --- Remove Registered Vehicle Asset ---")
+    plate = input("Enter Vehicle Plate Number to DELETE: ").strip().upper()
+    
+    if not plate:
+        print("  Input Error: Plate number cannot be empty.")
+        return
+
+    try:
+        cur = conn.cursor(dictionary=True)
+        # Pre-flight check: Verify asset existence
+        cur.execute("SELECT make, model FROM vehicle WHERE plate_number = %s", (plate,))
+        vehicle = cur.fetchone()
+        
+        if not vehicle:
+            print(f"  Search Error: Vehicle asset plate '{plate}' not found in registry database.")
             cur.close()
-    except mysql.connector.Error as err: print(f" Error: {err}")
+            return
+
+        # Count dependent citation entries
+        cur.execute("SELECT COUNT(*) AS c FROM violation WHERE plate_number = %s", (plate,))
+        v_count = cur.fetchone()['c']
+        cur.close()
+
+        if v_count > 0:
+            print(f"\n  RELATIONAL IMPACT NOTICE: Vehicle asset {plate} is linked to {v_count} citation record(s).")
+            print("   Wiping this car will cascade-delete its tracking logs from the violation ledger.")
+
+        confirm = input(f"\nConfirm permanent structural removal of asset {plate}? (YES/NO): ").strip().upper()
+        if confirm != 'YES':
+            print("  Transaction cancelled by user.")
+            return
+
+        cur = conn.cursor()
+        
+        cur.execute("DELETE FROM demerit_ledger WHERE violation_id IN (SELECT violation_id FROM violation WHERE plate_number = %s)", (plate,))        
+        cur.execute("DELETE FROM violation WHERE plate_number = %s", (plate,))        
+        cur.execute("DELETE FROM registration WHERE plate_number = %s", (plate,))        
+        cur.execute("DELETE FROM vehicle WHERE plate_number = %s", (plate,))
+        
+        conn.commit()
+        print(f"\n  SUCCESS: Vehicle profile asset '{plate}' and its lifecycle registries cleared.")
+        cur.close()
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        print(f"  Database Modification Refused: {err}")
